@@ -1,18 +1,46 @@
-from setuptools import setup
+#!/usr/bin/env python
+#
+# -*- mode:python; sh-basic-offset:4; indent-tabs-mode:nil; coding:utf-8 -*-
+# vim:set tabstop=4 softtabstop=4 expandtab shiftwidth=4 fileencoding=utf-8:
+#
 
-setup(
+import setuptools
+import sys
+
+import table
+
+
+install_requires = [
+    _.strip()
+    for _ in open('requirements.txt').readlines()
+    if _ and not _.startswith('#')
+]
+
+# only required when you are doing testing
+test_requires = [
+    'moto',
+    'pep8',
+]
+
+args = sys.argv[1:]
+# if we are installing just punt all extra reqs and do install_requires only
+if 'install' not in args:
+    for arg in args:
+        if arg == 'test':
+            install_requires.extend(test_requires)
+            continue
+
+setuptools.setup(
     name='tablesnap',
-    version='0.6.2',
+    version=table.__version__,
     author='Jeremy Grosser',
     author_email='jeremy@synack.me',
-    scripts=[
-        'tablesnap',
-        'tableslurp',
-        'tablechop'
-    ],
-    install_requires=[
-        x.strip()
-        for x in open('requirements.txt').readlines()
-        if x and not x.startswith('#')
-    ],
+    packages=setuptools.find_packages('table'),
+    package_dir={
+        '': 'table',
+    },
+    license='BSD',
+    install_requires=install_requires,
+    zip_safe=False,
+    test_suite='tests.all.test_suites',
 )
