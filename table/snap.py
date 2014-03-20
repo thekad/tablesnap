@@ -1,41 +1,33 @@
 #!/usr/bin/env python
-import pyinotify
-import boto
+#
+# -*- mode:python; sh-basic-offset:4; indent-tabs-mode:nil; coding:utf-8 -*-
+# vim:set tabstop=4 softtabstop=4 expandtab shiftwidth=4 fileencoding=utf-8:
+#
+
+from __future__ import absolute_import
 
 import argparse
-from traceback import format_exc
-from threading import Thread
-from Queue import Queue
-import logging
-import logging.handlers
-import os.path
-import socket
+import boto
+import grp
 import json
-import sys
 import os
 import pwd
-import grp
+import pyinotify
+import Queue
 import re
 import signal
+import socket
 import StringIO
+import sys
+import traceback
+import threading
 
-default_log = logging.getLogger('tablesnap')
-if os.environ.get('TABLESNAP_SYSLOG', False):
-    facility = logging.handlers.SysLogHandler.LOG_DAEMON
-    syslog = logging.handlers.SysLogHandler(address='/dev/log', facility=facility)
-    syslog.setFormatter(logging.Formatter('tablesnap: %(message)s'))
-    default_log.addHandler(syslog)
-else:
-    stderr = logging.StreamHandler()
-    stderr.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
-    default_log.addHandler(stderr)
+from . import base
 
-if os.environ.get('TDEBUG', False):
-    default_log.setLevel(logging.DEBUG)
-else:
-    default_log.setLevel(logging.INFO)
 
-default_log.info('Starting up')
+LOGGER = base.set_logger('tablesnap')
+
+LOGGER.info('Starting up')
 
 # Default number of writer threads
 default_threads = 4
@@ -62,7 +54,7 @@ class UploadHandler(pyinotify.ProcessEvent):
                 include=None,
                 with_index=True,
                 keyname_separator=None,
-                log=default_log,
+                log=LOGGER,
                 md5_on_start=False):
         self.key = key
         self.secret = secret
@@ -86,9 +78,9 @@ class UploadHandler(pyinotify.ProcessEvent):
         else:
             self.chunk_size = None
 
-        self.fileq = Queue()
+        self.fileq = Queue.Queue()
         for i in range(int(threads)):
-            t = Thread(target=self.worker)
+            t = threading.Thread(target=self.worker)
             t.daemon = True
             t.start()
 
@@ -118,7 +110,7 @@ class UploadHandler(pyinotify.ProcessEvent):
                 self.upload_sstable(bucket, keyname, f)
             except:
                 self.log.critical("Failed uploading %s. Aborting.\n%s" %
-                             (f, format_exc()))
+                             (f, traceback.format_exc()))
                 # Brute force kill self
                 os.kill(os.getpid(), signal.SIGKILL)
 
@@ -154,7 +146,7 @@ class UploadHandler(pyinotify.ProcessEvent):
         if key == None:
             self.log.critical("Failed to lookup keyname %s after %d"
                               " retries\n%s" %
-                             (keyname, self.retries, format_exc()))
+                             (keyname, self.retries, traceback.format_exc()))
             raise
 
         if key.size != stat.st_size:
@@ -178,7 +170,7 @@ class UploadHandler(pyinotify.ProcessEvent):
                         return True
 
                     self.log.critical("Failed to open file: %s (%s)\n%s" %
-                                 (filename, strerror, format_exc(),))
+                                 (filename, strerror, traceback.format_exc(),))
                     raise
 
                 md5 = key.compute_md5(fp)
@@ -365,7 +357,7 @@ class UploadHandler(pyinotify.ProcessEvent):
                     bucket = self.get_bucket()
                     continue
         except:
-            self.log.error('Error uploading %s\n%s' % (keyname, format_exc()))
+            self.log.error('Error uploading %s\n%s' % (keyname, traceback.format_exc()))
             raise
 
 def get_mask(listen_events):
@@ -395,7 +387,7 @@ def backup_file(handler, filename, filedir, include, log):
     handler.add_file(fullpath)
 
 
-def backup_files(handler, paths, recurse, include, log=default_log):
+def backup_files(handler, paths, recurse, include, log=LOGGER):
     for path in paths:
         log.info('Backing up %s' % path)
         if recurse:
@@ -495,7 +487,7 @@ def main():
         ret = wm.add_watch(path, mask, rec=args.recursive,
                            auto_add=args.auto_add)
         if ret[path] == -1:
-            default_log.critical('add_watch failed for %s, bailing out!' %
+            LOGGER.critical('add_watch failed for %s, bailing out!' %
                                 (path))
             return 1
 
