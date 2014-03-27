@@ -9,7 +9,6 @@ from __future__ import absolute_import
 import argparse
 import boto
 import grp
-import json
 import os
 import pwd
 import pyinotify
@@ -21,62 +20,174 @@ import StringIO
 import sys
 import traceback
 import threading
+import time
+assert time
 
 from . import base
 
 
-LOGGER = base.set_logger('tablesnap')
-
-LOGGER.info('Starting up')
-
-# Default number of writer threads
-default_threads = 4
+# Setup logging and debugging levels
+LOGGER, DEBUG = base.set_logger('tablesnap')
 
 # Default retries
-default_retries = 1
+DEFAULT_RETRIES = 1
 
-# S3 limit for single file upload
-s3_limit = 5 * 2**30
-
-# Max file size to upload without doing multipart in MB
-max_file_size = 5120
+# Max file size to upload without doing multipart in MB (5Gb as per AWS)
+DEFAULT_MAX_FILE_SIZE = 5120
 
 # Default chunk size for multipart uploads in MB
-default_chunk_size = 256
+DEFAULT_CHUNK_SIZE = 256
 
-# Default inotify event to listen on
-default_listen_event = 'IN_MOVED_TO'
+# Choices for listen events
+LISTEN_EVENTS = [
+    'IN_MOVED_TO',
+    'IN_CLOSE_WRITE',
+    'IN_CREATE',
+    'IN_MODIFY',
+]
+
+# Default inotify events to listen on
+DEFAULT_LISTEN_EVENTS = ['IN_MOVED_TO']
+
+# Default filtering
+DEFAULT_INCLUDE = lambda path: path.find('-tmp') == -1
+
+
+def get_fs_meta(filename):
+    """
+    Gets the filesystem metadata of a given file
+    """
+
+    meta = None
+    if os.path.isfile(filename):
+        try:
+            stat = os.stat(filename)
+        except OSError:
+            # File removed?
+            return None
+
+        meta = {'uid': stat.st_uid,
+                'gid': stat.st_gid,
+                'mode': stat.st_mode}
+        try:
+            u = pwd.getpwuid(stat.st_uid)
+            meta['user'] = u.pw_name
+        except:
+            pass
+
+        try:
+            g = grp.getgrgid(stat.st_gid)
+            meta['group'] = g.gr_name
+        except:
+            pass
+
+    return meta
+
+
+def get_mask(listen_events=DEFAULT_LISTEN_EVENTS):
+    """
+    Gets the mask to be acted upon based on inotify events
+    """
+
+    if set(listen_events).difference(LISTEN_EVENTS):
+        raise ValueError(
+            'You supplied an incorrect value for listen_events, correct values: %s' % (
+                ','.join(LISTEN_EVENTS),
+            )
+        )
+    mask = 0
+    for event in listen_events:
+        attr = getattr(pyinotify, event.upper())
+        mask = mask | attr
+
+    return mask
+
+
+def save_snapshot(filenames):
+    """
+    Saves a directory listing to the root of the target with a timestamp
+    """
+
+    pass
+
+
+def backup_file(handler, filename, include=None, log=LOGGER, save_snapshot=False):
+    """
+    Backups a single file given an upload handler
+    """
+
+    if os.path.isdir(filename):
+        return
+
+    if include is None or (
+        include is not None
+        and include(filename)
+    ):
+        log.info('Skipping %s due to exclusion rule' % (filename,))
+        return
+
+    handler.add_file(filename, save_snapshot)
+    return
+
+
+def backup_files(handler, paths, recurse, include=None, log=LOGGER):
+    """
+    Backups a list of directories via an upload handler. These directories
+    can be recursively uploaded and filtered
+    """
+
+    snapshot = base.get_dir_snapshot(paths, recurse, include)
+    for filename in snapshot:
+        log.info('Backing up %s' % (filename,))
+        backup_file(handler, filename, include)
+    return save_snapshot(snapshot)
+
+
+def get_free_memory_in_kb():
+    """
+    Returns the available free memory in Unix systems by examining
+    /proc/meminfo. Perhaps if (ever) windows is supported we can change this
+    """
+
+    f = open(os.path.join('proc', 'meminfo'), 'r')
+    memlines = f.readlines()
+    f.close()
+    lines = []
+    for line in memlines:
+        ml = line.rstrip(' kB\n').split(':')
+        lines.append((ml[0], int(ml[1].strip())))
+    d = dict(lines)
+    return d['Cached'] + d['MemFree'] + d['Buffers']
 
 
 class UploadHandler(pyinotify.ProcessEvent):
-    def my_init(self, threads=None, key=None, secret=None, bucket_name=None,
-                prefix=None, name=None, max_size=None, chunk_size=None,
-                include=None,
-                with_index=True,
-                keyname_separator=None,
-                log=LOGGER,
-                md5_on_start=False):
+    def my_init(
+        self, key, secret, bucket_name,
+        threads=base.DEFAULT_THREADS,
+        prefix='', name=socket.getfqdn(),
+        max_size=DEFAULT_MAX_FILE_SIZE,
+        chunk_size=DEFAULT_CHUNK_SIZE,
+        include=DEFAULT_INCLUDE, log=LOGGER,
+        md5_on_start=False, debug=DEBUG,
+        retries=DEFAULT_RETRIES,
+        without_index=False,
+        recurse=False,
+    ):
         self.key = key
         self.secret = secret
         self.bucket_name = bucket_name
         self.prefix = prefix
-        self.name = name or socket.getfqdn()
-        self.keyname_separator = keyname_separator
-        self.retries = default_retries
+        self.name = name
+        self.retries = retries
         self.log = log
         self.include = include
-        self.with_index = with_index
         self.md5_on_start = md5_on_start
+        self.debug = debug
+        self.without_index = without_index
+        self.recurse = recurse
 
-        if max_size:
-            self.max_size = max_size * 2**20
-        else:
-            self.max_size = max_file_size * 2**20
-
-        if chunk_size:
-            self.chunk_size = chunk_size * 2**20
-        else:
-            self.chunk_size = None
+        self.max_size = max_size * 2**20
+        self.chunk_size = chunk_size * 2**20
 
         self.fileq = Queue.Queue()
         for i in range(int(threads)):
@@ -84,77 +195,77 @@ class UploadHandler(pyinotify.ProcessEvent):
             t.daemon = True
             t.start()
 
-    def build_keyname(self, pathname):
-        return '%s%s%s%s' % (self.prefix, self.name, self.keyname_separator,
-                             pathname)
+    def _bucket(self):
+        """
+        Returns a new bucket connected to s3
+        """
 
-    def add_file(self, filename):
-        if self.include is None or (self.include is not None
-                                    and self.include(filename)):
-            self.fileq.put(filename)
+        return base.get_bucket(
+            base.s3_connect(
+                self.key, self.secret, self.debug
+            ), self.bucket_name
+        )
+
+    def add_file(self, filename, save_snapshot=False):
+        """
+        Adds a file to be uploaded to the internal Queue
+        """
+
+        if self.include is None or (
+            self.include is not None
+            and self.include(filename)
+        ):
+            self.fileq.put((filename, save_snapshot))
         else:
             self.log.info('Skipping %s due to exclusion rule' % filename)
 
-    def get_bucket(self):
-        # Reconnect to S3
-        s3 = boto.connect_s3(self.key, self.secret)
-        return s3.get_bucket(self.bucket_name)
+    def process_default(self, event):
+        """
+        Default file processing for all events
+        """
 
-    def worker(self):
-        bucket = self.get_bucket()
+        self.add_file(event.pathname, save_snapshot=True)
 
-        while True:
-            f = self.fileq.get()
-            keyname = self.build_keyname(f)
-            try:
-                self.upload_sstable(bucket, keyname, f)
-            except:
-                self.log.critical("Failed uploading %s. Aborting.\n%s" %
-                             (f, traceback.format_exc()))
-                # Brute force kill self
-                os.kill(os.getpid(), signal.SIGKILL)
-
-            self.fileq.task_done()
-
-    def process_IN_CLOSE_WRITE(self, event):
-        self.add_file(event.pathname)
-
-    def process_IN_MOVED_TO(self, event):
-        self.add_file(event.pathname)
-
-    #
-    # Check if this keyname (ie, file) has already been uploaded to
-    # the S3 bucket. This will verify that not only does the keyname
-    # exist, but that the MD5 sum is the same -- this protects against
-    # partial or corrupt uploads. IF you enable md5 at start
-    #
     def key_exists(self, bucket, keyname, filename, stat):
+        """
+        Check if this keyname (ie, file) has already been uploaded to
+        the S3 bucket. This will verify that not only does the keyname
+        exist, but that the MD5 sum is the same -- this protects against
+        partial or corrupt uploads. IF you enable md5 at start
+        """
+
         key = None
         for r in range(self.retries):
             try:
                 key = bucket.get_key(keyname)
-                if key == None:
+                if key is None:
                     self.log.debug('Key %s does not exist' % (keyname,))
                     return False
                 else:
                     self.log.debug('Found key %s' % (keyname,))
                     break
             except:
-                bucket = self.get_bucket()
+                # Might have lost connection, reconnect
+                bucket = self._bucket()
                 continue
 
-        if key == None:
-            self.log.critical("Failed to lookup keyname %s after %d"
-                              " retries\n%s" %
-                             (keyname, self.retries, traceback.format_exc()))
+        else:
+            self.log.critical(
+                'Failed to lookup keyname %s after %d retries' % (
+                    keyname, self.retries,
+                )
+            )
+            self.log.critical(traceback.format_exc())
             raise
 
-        if key.size != stat.st_size:
-            self.log.warning('ATTENTION: your source (%s) and target (%s) '
+        if key.size != stat['size']:
+            self.log.warning(
+                'ATTENTION: your source (%s) and target (%s) '
                 'sizes differ, you should take a look. As immutable files '
                 'never change, one must assume the local file got corrupted '
                 'and the right version is the one in S3. Will skip this file '
-                'to avoid future complications' % (filename, keyname, ))
+                'to avoid future complications' % (filename, keyname, )
+            )
             return True
         else:
             if not self.md5_on_start:
@@ -163,64 +274,73 @@ class UploadHandler(pyinotify.ProcessEvent):
             else:
                 # Compute MD5 sum of file
                 try:
-                    fp = open(filename, "r")
+                    fp = open(filename, 'rb')
                 except IOError as (errno, strerror):
                     if errno == 2:
                         # The file was removed, return True to skip this file.
                         return True
 
-                    self.log.critical("Failed to open file: %s (%s)\n%s" %
-                                 (filename, strerror, traceback.format_exc(),))
+                    self.log.critical(
+                        'Failed to open file: %s (%s)\n%s' % (
+                            filename, strerror, traceback.format_exc(),
+                        )
+                    )
                     raise
 
                 md5 = key.compute_md5(fp)
                 fp.close()
                 self.log.debug('Computed md5: %s' % (md5,))
 
-                meta = key.get_metadata('md5sum')
+                md5sum = key.get_metadata('md5sum')
 
-                if meta:
+                if md5sum:
                     self.log.debug('MD5 metadata comparison: %s == %s? : %s' %
-                                  (md5[0], meta, (md5[0] == meta)))
-                    result = (md5[0] == meta)
+                                  (md5[0], md5sum, (md5[0] == md5sum)))
+                    result = (md5[0] == md5sum)
                 else:
-                    self.log.debug('ETag comparison: %s == %s? : %s' %
-                                  (md5[0], key.etag.strip('"'),
-                                  (md5[0] == key.etag.strip('"'))))
+                    self.log.debug(
+                        'ETag comparison: %s == %s? : %s' % (
+                            md5[0], key.etag.strip('"'),
+                            (md5[0] == key.etag.strip('"')),
+                        )
+                    )
                     result = (md5[0] == key.etag.strip('"'))
                     if result:
                         self.log.debug('Setting missing md5sum metadata for %s' %
                                       (keyname,))
                         key.set_metadata('md5sum', md5[0])
-        
+
                 if result:
-                    self.log.info("Keyname %s already exists, skipping upload"
-                                  % (keyname))
+                    self.log.info(
+                        'Keyname %s already exists, skipping upload' % (
+                            keyname
+                        )
+                    )
                 else:
-                    self.log.warning('ATTENTION: your source (%s) and target (%s) '
+                    self.log.warning(
+                        'ATTENTION: your source (%s) and target (%s) '
                         'MD5 hashes differ, you should take a look. As immutable '
                         'files never change, one must assume the local file got '
                         'corrupted and the right version is the one in S3. Will '
-                        'skip this file to avoid future complications' % 
-                        (filename, keyname, ))
+                        'skip this file to avoid future complications' % (
+                            filename, keyname,
+                        )
+                    )
 
                 return result
 
-    def get_free_memory_in_kb(self):
-        f = open('/proc/meminfo', 'r')
-        memlines = f.readlines()
-        f.close()
-        lines = []
-        for line in memlines:
-            ml = line.rstrip(' kB\n').split(':')
-            lines.append((ml[0], int(ml[1].strip())))
-        d = dict(lines)
-        return d['Cached'] + d['MemFree'] + d['Buffers']
+    def split_file(self, filename):
+        """
+        A generator that yields chunks of a given file based on how parameters
+        or how much available memory there is in the system
+        """
 
-    def split_sstable(self, filename):
-        free = self.get_free_memory_in_kb() * 1024
-        self.log.debug('Free memory check: %d < %d ? : %s' %
-            (free, self.chunk_size, (free < self.chunk_size)))
+        free = get_free_memory_in_kb() * 1024
+        self.log.debug(
+            'Free memory check: %d < %d ? : %s' % (
+                free, self.chunk_size, (free < self.chunk_size),
+            )
+        )
         if free < self.chunk_size:
             self.log.warn('Your system is low on memory, '
                           'reading in smaller chunks')
@@ -239,17 +359,18 @@ class UploadHandler(pyinotify.ProcessEvent):
         if f and not f.closed:
             f.close()
 
-    def upload_sstable(self, bucket, keyname, filename):
+    def upload_file(self, bucket, keyname, filename):
+        """
+        Handles the actual file upload, either monolithic or multipart
+        """
 
         # Include the file system metadata so that we have the
         # option of using it to restore the file modes correctly.
-        #
-        try:
-            stat = os.stat(filename)
-        except OSError:
-            # File removed?
+        stat = get_fs_meta(filename)
+        if not stat:
             return
 
+        # Already uploaded this file, skip it
         if self.key_exists(bucket, keyname, filename, stat):
             return
         else:
@@ -259,69 +380,38 @@ class UploadHandler(pyinotify.ProcessEvent):
             fp.close()
 
         def progress(sent, total):
+            "Progress callback"
+
             if sent == total:
                 self.log.info('Finished uploading %s' % filename)
 
         try:
-            dirname = os.path.dirname(filename)
-            if self.with_index:
-                listdir = []
-                for listfile in os.listdir(dirname):
-                    if self.include is None or (self.include is not None
-                                                and self.include(listfile)):
-                        listdir.append(listfile)
-                json_str = json.dumps({dirname: listdir})
-                for r in range(self.retries):
-                    try:
-                        key = bucket.new_key('%s-listdir.json' % keyname)
-                        key.set_contents_from_string(json_str,
-                            headers={'Content-Type': 'application/json'},
-                            replace=True)
-                        break
-                    except:
-                        if r == self.retries - 1:
-                            self.log.critical("Failed to upload directory "
-                                              "listing.")
-                            raise
-                        bucket = self.get_bucket()
-                        continue
-
-            meta = {'uid': stat.st_uid,
-                    'gid': stat.st_gid,
-                    'mode': stat.st_mode}
-            try:
-                u = pwd.getpwuid(stat.st_uid)
-                meta['user'] = u.pw_name
-            except:
-                pass
-
-            try:
-                g = grp.getgrgid(stat.st_gid)
-                meta['group'] = g.gr_name
-            except:
-                pass
-
             self.log.info('Uploading %s' % filename)
-
-            meta = json.dumps(meta)
 
             for r in range(self.retries):
                 try:
-                    self.log.debug('File size check: %s > %s ? : %s' %
-                        (stat.st_size, self.max_size,
-                        (stat.st_size > self.max_size),))
-                    if stat.st_size > self.max_size:
+                    self.log.debug(
+                        'File size check: %s > %s ? : %s' % (
+                            stat['size'], self.max_size,
+                            (stat['size'] > self.max_size),
+                        )
+                    )
+                    if stat['size'] > self.max_size:
                         self.log.info('Performing multipart upload for %s' %
                                      (filename))
-                        mp = bucket.initiate_multipart_upload(keyname,
-                            metadata={'stat': meta, 'md5sum': md5[0]})
+                        mp = bucket.initiate_multipart_upload(
+                            keyname,
+                            metadata={'stat': stat, 'md5sum': md5[0]}
+                        )
                         part = 1
                         chunk = None
                         try:
-                            for chunk in self.split_sstable(filename):
-                                self.log.debug('Uploading part #%d '
-                                               '(size: %d)' %
-                                               (part, chunk.len,))
+                            for chunk in self.split_file(filename):
+                                self.log.debug(
+                                    'Uploading part #%d (size: %d)' % (
+                                        part, chunk.len,
+                                    )
+                                )
                                 mp.upload_part_from_file(chunk, part)
                                 chunk.close()
                                 part += 1
@@ -340,7 +430,7 @@ class UploadHandler(pyinotify.ProcessEvent):
                     else:
                         self.log.debug('Performing monolithic upload')
                         key = bucket.new_key(keyname)
-                        key.set_metadata('stat', meta)
+                        key.set_metadata('stat', stat)
                         key.set_metadata('md5sum', md5[0])
                         key.set_contents_from_filename(filename, replace=True,
                                                        cb=progress, num_cb=1,
@@ -352,149 +442,206 @@ class UploadHandler(pyinotify.ProcessEvent):
                         return
 
                     if r == self.retries - 1:
-                        self.log.critical("Failed to upload file contents.")
+                        self.log.critical('Failed to upload file contents.')
                         raise
-                    bucket = self.get_bucket()
+
+                    # Might have lost connection, reconnect
+                    bucket = self._bucket()
                     continue
+
         except:
             self.log.error('Error uploading %s\n%s' % (keyname, traceback.format_exc()))
             raise
 
-def get_mask(listen_events):
-    if not listen_events:
-        listen_events = [default_listen_event]
+    def worker(self):
+        """
+        Main threading.Thread method
+        """
 
-    mask = 0
-    while listen_events:
-        mask = mask | getattr(pyinotify, listen_events.pop())
+        while True:
+            filename, track = self.fileq.get()
+            if track:
+                snapshot = base.get_dir_snapshot(self.paths, self.recurse, self.include)
+            keyname = '%s%s%s' % (self.prefix, self.name, filename)
+            self.log.debug('Key is %s' % (keyname,))
+            try:
+                self.upload_file(self._bucket(), keyname, filename)
+                if track and not self.without_index:
+                    save_snapshot(snapshot)
+            except:
+                self.log.critical(
+                    'Failed uploading %s. Aborting.\n%s' % (
+                        filename, traceback.format_exc()
+                    )
+                )
+                # Brute force kill self
+                os.kill(os.getpid(), signal.SIGKILL)
 
-    return mask
-
-
-def backup_file(handler, filename, filedir, include, log):
-    if not filedir.endswith('/'):
-        filedir += '/'
-
-    fullpath = os.path.abspath('%s%s' % (filedir, filename))
-
-    if os.path.isdir(fullpath):
-        return
-
-    if not include(fullpath):
-        log.info('Skipping %s due to exclusion rule' % fullpath)
-        return
-
-    handler.add_file(fullpath)
-
-
-def backup_files(handler, paths, recurse, include, log=LOGGER):
-    for path in paths:
-        log.info('Backing up %s' % path)
-        if recurse:
-            for root, dirs, files in os.walk(path):
-                for filename in files:
-                    backup_file(handler, filename, root, include, log)
-        else:
-            for filename in os.listdir(path):
-                backup_file(handler, filename, path, include, log)
-    return 0
+            self.fileq.task_done()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Tablesnap is a script that '
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description='Tablesnap is a script that '
         'uses inotify to monitor a directory for events and reacts to them by '
         'spawning a new thread to upload that file to Amazon S3, along with '
         'a JSON-formatted list of what other files were in the directory at '
-        'the time of the copy.')
+        'the time of the copy.'
+    )
     parser.add_argument('bucket', help='S3 bucket')
-    parser.add_argument('paths', nargs='+', help='Paths to be watched')
-    parser.add_argument('-k', '--aws-key', required=True)
-    parser.add_argument('-s', '--aws-secret', required=True)
-    parser.add_argument('-r', '--recursive', action='store_true',
-        default=False,
-        help='Recursively watch the given path(s)s for new SSTables')
-    parser.add_argument('-a', '--auto-add', action='store_true', default=False,
-        help='Automatically start watching new subdirectories within path(s)')
-    parser.add_argument('-B', '--backup', action='store_true', default=False,
-        help='Backup existing files to S3 if they are not already there')
-    parser.add_argument('-p', '--prefix', default='',
-        help='Set a string prefix for uploaded files in S3')
-    parser.add_argument('--without-index', action='store_true', default=False,
-        help='Do not store a JSON representation of the current directory '
-             'listing in S3 when uploading a file to S3.')
-    parser.add_argument('--keyname-separator', default=':',
-        help='Separator for the keyname between name and path.')
-    parser.add_argument('-t', '--threads', default=default_threads,
-        help='Number of writer threads')
-    parser.add_argument('-n', '--name',
-        help='Use this name instead of the FQDN to identify the files from '
-             'this host')
-    parser.add_argument('--md5-on-start', default=False, action='store_true',
+    parser.add_argument('paths', metavar='path', nargs='+', help='Path(s) to be watched')
+    parser.add_argument(
+        '-k', '--aws-key', required=not os.environ.get('AWS_ACCESS_KEY_ID', False),
+        help='Your AWS key id, defaults to ENV[AWS_ACCESS_KEY_ID] if set',
+        default=os.environ.get('AWS_ACCESS_KEY_ID')
+    )
+    parser.add_argument(
+        '-s', '--aws-secret', required=not os.environ.get('AWS_SECRET_ACCESS_KEY', False),
+        help='Your AWS key secret, defaults to ENV[AWS_SECRET_ACCESS_KEY] if set',
+        default=os.environ.get('AWS_SECRET_ACCESS_KEY')
+    )
+    parser.add_argument(
+        '-r', '--recursive', action='store_true', default=False,
+        help='Recursively watch the given path(s)s for new SSTables'
+    )
+    parser.add_argument(
+        '-a', '--auto-add', action='store_true', default=False,
+        help='Automatically start watching new subdirectories within path(s)'
+    )
+    parser.add_argument(
+        '-p', '--prefix', default='',
+        help='Set a string prefix for uploaded files in S3'
+    )
+    parser.add_argument(
+        '-t', '--threads', default=base.DEFAULT_THREADS, type=int,
+        help='Number of writer threads'
+    )
+    parser.add_argument(
+        '-n', '--name', default=socket.getfqdn(),
+        help='Use this name instead of the FQDN to identify the files from this host'
+    )
+    parser.add_argument(
+        '--md5-on-start', default=False, action='store_true',
         help='If you want to compute *every file* for its MD5 checksum at '
-             'start time, enable this option.')
-    parser.add_argument('--listen-events', action='append',
-        choices=['IN_MOVED_TO', 'IN_CLOSE_WRITE'],
+             'start time, enable this option.'
+    )
+    parser.add_argument(
+        '-R', '--retries', default=DEFAULT_RETRIES, type=int,
+        help='Default times to retry on all S3 operations'
+    )
+    parser.add_argument(
+        '-l', '--listen-events', action='append',
+        choices=LISTEN_EVENTS,
+        default=DEFAULT_LISTEN_EVENTS,
         help='Which events to listen on, can be specified multiple times. '
-             'Values: IN_MOVED_TO (default), IN_CLOSE_WRITE')
+             'Values: %s' % (','.join(LISTEN_EVENTS))
+    )
+    mode_choices = [
+        'daemon',
+        'singlepass',
+        'singlefile',
+    ]
+    parser.add_argument(
+        '-m', '--mode', choices=mode_choices,
+        default='daemon',
+        help='What mode you want to start tablesnap in'
+    )
 
     include_group = parser.add_mutually_exclusive_group()
-    include_group.add_argument('-e', '--exclude', default=None,
+    include_group.add_argument(
+        '-e', '--exclude', default=None,
         help='Exclude files matching this regular expression from upload.'
              'WARNING: If neither exclude nor include are defined, then all '
-             'files matching "-tmp" are excluded.')
-    include_group.add_argument('-i', '--include', default=None,
+             'files matching "-tmp" are excluded.'
+    )
+    include_group.add_argument(
+        '-i', '--include', default=None,
         help='Include only files matching this regular expression into upload.'
              'WARNING: If neither exclude nor include are defined, then all '
-             'files matching "-tmp" are excluded.')
+             'files matching "-tmp" are excluded.'
+    )
 
-    parser.add_argument('--max-upload-size', default=max_file_size,
-        help='Max size for files to be uploaded before doing multipart '
-             '(default %dM)' % max_file_size)
-    parser.add_argument('--multipart-chunk-size', default=default_chunk_size,
-        help='Chunk size for multipart uploads (default: %dM or 10%%%% of '
-             'free memory if default is not available)' % default_chunk_size)
+    parser.add_argument(
+        '--max-upload-size', default=DEFAULT_MAX_FILE_SIZE, type=int,
+        help='Max size (in Mb) for files before doing multipart upload'
+    )
+    parser.add_argument(
+        '--multipart-chunk-size', default=DEFAULT_CHUNK_SIZE, type=int,
+        help='Chunk size (in Mb) for multipart uploads (%dMb or 10%%%% of '
+             'free memory)' % DEFAULT_CHUNK_SIZE
+    )
+    parser.add_argument(
+        '--without-index', default=False, action='store_true',
+        help='Skip adding a directory listing file per file backed up'
+    )
 
     args = parser.parse_args()
 
-    # For backwards-compatibility: If neither exclude nor include are set,
-    # then include only files not matching '-tmp'. This was the default
-    include = lambda path: path.find('-tmp') == -1
+    # File filtering
+    include = DEFAULT_INCLUDE
     if args.exclude:
         include = lambda path: not re.search(args.exclude, path)
     if args.include:
-        include = lambda path: not not re.search(args.include, path)
+        include = lambda path: re.search(args.include, path)
 
     # Check S3 credentials only. We reconnect per-thread to avoid any
     # potential thread-safety problems.
-    s3 = boto.connect_s3(args.aws_key, args.aws_secret)
-    bucket = s3.get_bucket(args.bucket)
+    s3 = base.s3_connect(args.aws_key, args.aws_secret, DEBUG)
+    assert s3
 
-    handler = UploadHandler(threads=args.threads, key=args.aws_key,
-                            secret=args.aws_secret, bucket_name=bucket,
-                            prefix=args.prefix, name=args.name,
-                            include=include,
-                            with_index=(not args.without_index),
-                            keyname_separator=args.keyname_separator,
-                            max_size=int(args.max_upload_size),
-                            chunk_size=int(args.multipart_chunk_size),
-                            md5_on_start=args.md5_on_start)
+    handler = UploadHandler(
+        key=args.aws_key,
+        secret=args.aws_secret,
+        bucket_name=args.bucket,
+        prefix=args.prefix,
+        name=args.name,
+        threads=args.threads,
+        include=include,
+        log=LOGGER,
+        max_size=int(args.max_upload_size),
+        chunk_size=int(args.multipart_chunk_size),
+        md5_on_start=args.md5_on_start,
+        debug=DEBUG,
+        retries=args.retries,
+        without_index=args.without_index,
+        recurse=args.recurse,
+    )
 
-    wm = pyinotify.WatchManager()
-    notifier = pyinotify.Notifier(wm, handler)
+    LOGGER.info('Starting up in %s mode' % (args.mode,))
 
-    mask = get_mask(args.listen_events)
-    for path in args.paths:
-        ret = wm.add_watch(path, mask, rec=args.recursive,
-                           auto_add=args.auto_add)
-        if ret[path] == -1:
-            LOGGER.critical('add_watch failed for %s, bailing out!' %
-                                (path))
-            return 1
+    if args.mode == 'daemon':
+        wm = pyinotify.WatchManager()
+        notifier = pyinotify.Notifier(wm, handler)
 
-    if args.backup:
+        mask = get_mask(args.listen_events)
+        for path in args.paths:
+            ret = wm.add_watch(path, mask, rec=args.recursive,
+                               auto_add=args.auto_add)
+            if ret[path] == -1:
+                LOGGER.critical('add_watch failed for %s, bailing out!' % (path))
+                return 1
+
         backup_files(handler, args.paths, args.recursive, include)
+        notifier.loop()
+    elif args.mode == 'singlepass':
+        backup_files(handler, args.paths, args.recursive, include)
+    elif args.mode == 'singlefile':
+        for p in args.paths:
+            if not os.path.isfile(p):
+                LOGGER.warning(
+                    'When using "onefile" you have to point to files, '
+                    'not directories. Skipping %s' % (p,)
+                )
+                continue
+            filename = os.path.basename(p)
+            path = os.path.dirname(p)
+            backup_file(handler, filename, include)
+    else:
+        pass
 
-    notifier.loop()
+    return 0
+
 
 if __name__ == '__main__':
     sys.exit(main())
