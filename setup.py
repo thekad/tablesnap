@@ -8,23 +8,15 @@ import os
 import setuptools
 import sys
 
-import table
+import tablesnap
 
 
-readme = os.path.join(os.path.dirname(sys.argv[0]), 'README.md')
+readme = os.path.join(os.path.dirname(sys.argv[0]), 'README.rst')
 reqs = os.path.join(os.path.dirname(sys.argv[0]), 'requirements.txt')
-test_reqs = os.path.join(os.path.dirname(sys.argv[0]), 'test-requirements.txt')
 
 install_requires = [
     _.strip()
     for _ in open(reqs).readlines()
-    if _ and not _.startswith('#')
-]
-
-# only required when you are doing testing
-test_requires = [
-    _.strip()
-    for _ in open(test_reqs).readlines()
     if _ and not _.startswith('#')
 ]
 
@@ -33,14 +25,23 @@ args = sys.argv[1:]
 if 'install' not in args:
     for arg in args:
         if arg == 'test':
+            test_reqs = os.path.join(
+                os.path.dirname(sys.argv[0]), 'test-requirements.txt'
+            )
+#           only required when you are doing testing
+            test_requires = [
+                _.strip()
+                for _ in open(test_reqs).readlines()
+                if _ and not _.startswith('#')
+            ]
             install_requires.extend(test_requires)
-            continue
 
 setuptools.setup(
     name='tablesnap',
-    version=table.__version__,
+    version=tablesnap.__version__,
     author='Jeremy Grosser',
     author_email='jeremy@synack.me',
+    url='https://github.com/synack/tablesnap',
     description='Uses inotify to monitor Cassandra SSTables and upload them to S3',
     long_description=open(readme).read(),
     keywords=[
@@ -48,9 +49,12 @@ setuptools.setup(
         'inotify',
         'backup',
     ],
-    packages=setuptools.find_packages('table'),
-    package_dir={
-        '': 'table',
+    packages=setuptools.find_packages(),
+    entry_points={
+        'console_scripts': [
+            'tablesnap=tablesnap.snap:main',
+            'tableslurp=tablesnap.slurp:main',
+        ],
     },
     license='BSD',
     install_requires=install_requires,
