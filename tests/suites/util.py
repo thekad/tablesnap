@@ -5,24 +5,50 @@
 #
 
 import os
+import tempfile
 
 
 TOP_DIR = os.path.realpath('%s/../../' % (os.path.dirname(os.path.realpath(__file__)),))
 TEST_DIR = os.path.realpath('%s/../' % (os.path.dirname(os.path.realpath(__file__)),))
+SOURCE_DIR = os.path.realpath('%s/../../tablesnap' % (os.path.dirname(os.path.realpath(__file__)),))
 
 
-def get_source_filenames():
+def create_random_files(root, *args):
     """
-Get all python files so they can be tested.
-"""
+    Creates a given number of  random files, it receives a tuple consisting
+    of how many files and (optionally) a second parameter which can be a tuple
+    of the same structure, this is so you can create random files in
+    subdirectories recursively
+    """
 
-    filenames = []
-    for root, dirs, files in os.walk(
-        os.path.join(TOP_DIR, 'table')
-    ):
-        for f in files:
-            filename = os.path.join(root, f)
-            if f.endswith('.py') and os.path.getsize(filename) > 0:
-                filenames.append(filename)
+    print root, args
+    if not os.path.isdir(root):
+        print 'Creating directory %s' % root
+        os.makedirs(os.path.expanduser(root))
 
-    return filenames
+    for arg in args:
+        if isinstance(arg, tuple):
+            subdir = os.path.join(root, arg[0])
+            create_random_files(subdir, *arg[1:])
+        if isinstance(arg, int):
+            print 'Creating %d files' % arg
+            for file in xrange(0, arg):
+                tempfile.mkstemp(dir=root)
+
+if __name__ == '__main__':
+    create_random_files(
+        '/tmp/foo',
+        (
+            'subdir1',
+            20,
+            (
+                'sub-subdir1',
+                10
+            )
+        ),
+        (
+            'subdir2',
+            5
+        ),
+        30
+    )
