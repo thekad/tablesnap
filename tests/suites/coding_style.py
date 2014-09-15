@@ -35,7 +35,7 @@ class PEP8Test(unittest.TestCase):
 
 def test_cases():
     filenames = {}
-    for walkable in (util.TOP_DIR, util.TEST_DIR,):
+    for walkable in (util.SOURCE_DIR, util.TEST_DIR,):
         for root, dirs, files in os.walk(walkable):
             for f in files:
                 filename = os.path.join(root, f)
@@ -43,6 +43,7 @@ def test_cases():
                     filekey = os.path.join(os.path.basename(root), f)
                     filekey = filekey.replace('/', '_').replace('.', '_')
                     filenames['test_pep8_%s' % (filekey,)] = filename
+    filenames['test_pep8_setup_py'] = os.path.join(util.TOP_DIR, 'setup.py')
     pep8_suite = unittest.TestSuite()
     for k, v in filenames.items():
         pep8_suite.addTest(PEP8Test(k, v))
