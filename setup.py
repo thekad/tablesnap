@@ -5,36 +5,26 @@
 #
 
 import os
+import pip.req
 import setuptools
 import sys
 
 import tablesnap
 
 
-readme = os.path.join(os.path.dirname(sys.argv[0]), 'README.rst')
-reqs = os.path.join(os.path.dirname(sys.argv[0]), 'requirements.txt')
-
-install_requires = [
-    _.strip()
-    for _ in open(reqs).readlines()
-    if _ and not _.startswith('#')
-]
-
 args = sys.argv[1:]
-# if we are installing just punt all extra reqs and do install_requires only
-if 'install' not in args:
-    for arg in args:
-        if arg == 'test':
-            test_reqs = os.path.join(
-                os.path.dirname(sys.argv[0]), 'test-requirements.txt'
-            )
-#           only required when you are doing testing
-            test_requires = [
-                _.strip()
-                for _ in open(test_reqs).readlines()
-                if _ and not _.startswith('#')
-            ]
-            install_requires.extend(test_requires)
+reqs = 'requirements.txt'
+
+for arg in args:
+    if arg == 'test':
+        reqs = 'test-requirements.txt'
+
+readme = os.path.join(os.path.dirname(sys.argv[0]), 'README.rst')
+reqs = os.path.join(os.path.dirname(sys.argv[0]), reqs)
+
+install_requires = pip.req.parse_requirements(reqs)
+dependency_links = set([str(_.url) for _ in install_requires if _.url])
+install_requires = set([str(_.req) for _ in install_requires])
 
 setuptools.setup(
     name='tablesnap',
@@ -57,6 +47,7 @@ setuptools.setup(
         ],
     },
     license='BSD',
+    dependency_links=dependency_links,
     install_requires=install_requires,
     zip_safe=False,
     test_suite='tests.all.test_suites',
